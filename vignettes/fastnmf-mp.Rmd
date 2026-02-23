@@ -1,0 +1,14 @@
+---
+title: "fastNMF MP workflow"
+output: html_document
+---
+
+```{r}
+source("R/fastnmf.R")
+set.seed(1)
+X <- abs(matrix(rnorm(8000), nrow = 200, ncol = 40))
+rownames(X) <- paste0("G", seq_len(nrow(X)))
+out <- run_nmf_ranks(X, ranks = 4:6, top_genes = 150, topN = 50, nrun = 1, max_iter = 30)
+dim(out$Genes_nmf_w_basis)
+head(colnames(out$Genes_nmf_w_basis))
+```

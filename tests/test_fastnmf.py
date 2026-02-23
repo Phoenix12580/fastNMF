@@ -1,76 +1,105 @@
+import json
 import numpy as np
 import pytest
+from scipy import sparse
 
-from fastnmf import FastNMF, extract_gene_modules_3ca
-
-
-def test_reconstruction_error_decreases():
-    rng = np.random.default_rng(0)
-    m, n, k = 120, 80, 8
-    X = rng.random((m, k)) @ rng.random((k, n))
-
-    model = FastNMF(n_components=k, max_iter=100, tol=1e-6, init="nndsvd", check_every=2, random_state=0)
-    res = model.factorize(X)
-
-    assert len(res.history) >= 2
-    assert res.history[-1] <= res.history[0]
-    assert res.n_iter <= model.max_iter
+from fastnmf import (
+    MetaProgram,
+    Program,
+    build_cohort_mps,
+    compute_plot_data_jaccard,
+    fit_global_hvg,
+    nmf_fit,
+    parse_ranks,
+    run_nmf_ranks,
+)
 
 
-def test_transform_shape():
-    rng = np.random.default_rng(1)
-    X = rng.random((60, 40))
-    model = FastNMF(n_components=6, max_iter=40, init="random", random_state=1)
-    model.fit(X)
-
-    X_new = rng.random((20, 40))
-    W_new = model.transform(X_new, n_iter=20)
-    assert W_new.shape == (20, 6)
+def test_parse_ranks_variants():
+    assert parse_ranks("4:6") == [4, 5, 6]
+    assert parse_ranks("4,6,9") == [4, 6, 9]
 
 
-def test_invalid_n_components_raises():
-    X = np.ones((10, 4))
-    model = FastNMF(n_components=5)
-    with pytest.raises(ValueError):
-        model.factorize(X)
+def test_loss_monotonic_nonincreasing_mu():
+    X = np.abs(np.random.default_rng(0).normal(size=(60, 40)))
+    fit = nmf_fit(X, k=4, nrun=1, method="mu", max_iter=30, early_stop_patience=100)
+    diffs = np.diff(fit.loss_curve)
+    assert np.all(diffs <= 1e-8)
 
 
-def test_memory_budget_resolves_batch_size():
-    X = np.ones((200, 100), dtype=np.float32)
-    model = FastNMF(n_components=10, max_memory_mb=0.05, dtype="float32")
-    b = model._resolve_batch_size(X)
-    assert b is not None
-    assert 1 <= b <= X.shape[1]
+def test_sparse_no_toarray_called(monkeypatch):
+    called = {"n": 0}
+
+    def boom(self):
+        called["n"] += 1
+        raise RuntimeError("toarray called")
+
+    monkeypatch.setattr(sparse.csr_matrix, "toarray", boom, raising=True)
+    X = sparse.random(200, 120, density=0.01, format="csr", random_state=1)
+    genes = [f"g{i}" for i in range(200)]
+    out = run_nmf_ranks(X, ranks=[2], top_genes=100, gene_names=genes, hvg_mode="per_sample", nrun=1, max_iter=3)
+    assert len(out["robust_programs"]) >= 0
+    assert called["n"] == 0
 
 
-def test_invalid_thread_or_memory_raises():
-    with pytest.raises(ValueError):
-        FastNMF(n_components=4, n_threads=0)
-    with pytest.raises(ValueError):
-        FastNMF(n_components=4, max_memory_mb=0)
+def test_single_sample_no_mp():
+    mps, best = build_cohort_mps({"s1": []})
+    assert mps == []
+    assert best == []
 
 
-def test_select_k_returns_candidate():
-    rng = np.random.default_rng(2)
-    X = rng.random((80, 60))
-    model = FastNMF(n_components=4, max_iter=20, check_every=2, random_state=2)
-    out = model.select_k(X, k_values=[2, 4, 6], metric="reconstruction")
-    assert out.best_k in {2, 4, 6}
-    assert set(out.scores.keys()) == {2, 4, 6}
+def test_multi_sample_mp_possible():
+    rp = {
+        "s1": [
+            {"robust_id": "a1", "sample_id": "s1", "member_program_ids": ["p1"], "support_distinct_k": 2, "consensus_top50": [f"g{i}" for i in range(50)]}
+            for _ in range(20)
+        ],
+        "s2": [
+            {"robust_id": "b1", "sample_id": "s2", "member_program_ids": ["p2"], "support_distinct_k": 2, "consensus_top50": [f"g{i}" for i in range(50)]}
+            for _ in range(20)
+        ],
+    }
+    from fastnmf import RobustProgram
+
+    cast = {k: [RobustProgram(**x) for x in v] for k, v in rp.items()}
+    mps, best = build_cohort_mps(cast, mp_min_programs=20, mp_min_tumors=2, mp_median_intra_jaccard=0)
+    assert len(mps) >= 1
+    assert len(best) >= 1
 
 
-def test_extract_gene_modules_3ca_shapes():
-    H = np.array([[3.0, 0.2, 1.2], [0.1, 2.5, 0.9]])
-    genes = ["A", "B", "C"]
-    mods = extract_gene_modules_3ca(H, genes, top_n=2, min_specificity=1.1)
-    assert set(mods.modules.keys()) == {0, 1}
+def test_global_fixed_reference_alignment():
+    x1 = sparse.csr_matrix(np.abs(np.random.default_rng(1).normal(size=(6, 5))))
+    g1 = ["a", "b", "c", "d", "e", "f"]
+    x2 = sparse.csr_matrix(np.abs(np.random.default_rng(2).normal(size=(6, 5))))
+    g2 = ["a", "b", "c", "x", "y", "z"]
+    ref = ["a", "b", "c"]
+    o1 = run_nmf_ranks(x1, ranks=[2], gene_names=g1, hvg_mode="global_fixed", reference_genes=ref, nrun=1, max_iter=2)
+    o2 = run_nmf_ranks(x2, ranks=[2], gene_names=g2, hvg_mode="global_fixed", reference_genes=ref, nrun=1, max_iter=2)
+    assert o1["genes"] == ref
+    assert o2["genes"] == ref
 
 
-def test_fit_best_k_sets_model_state():
-    rng = np.random.default_rng(3)
-    X = rng.random((50, 30))
-    m = FastNMF(n_components=2, max_iter=15, check_every=3, random_state=3)
-    sel, res = m.fit_best_k(X, [2, 3])
-    assert sel.best_k in {2, 3}
-    assert m.H_ is not None
-    assert res.H.shape[0] == sel.best_k
+def test_per_sample_gene_names_can_differ():
+    x1 = sparse.csr_matrix(np.abs(np.random.default_rng(1).normal(size=(10, 5))))
+    x2 = sparse.csr_matrix(np.abs(np.random.default_rng(2).normal(size=(10, 5))))
+    o1 = run_nmf_ranks(x1, ranks=[2], gene_names=[f"a{i}" for i in range(10)], hvg_mode="per_sample", nrun=1, max_iter=2)
+    o2 = run_nmf_ranks(x2, ranks=[2], gene_names=[f"b{i}" for i in range(10)], hvg_mode="per_sample", nrun=1, max_iter=2)
+    assert o1["genes"] != o2["genes"]
+
+
+def test_jaccard_edge_list_mode_large():
+    progs = [Program(f"p{i}", "s", 4, 1, [f"g{j}" for j in range(i % 10, i % 10 + 50)], {}) for i in range(2000)]
+    d = compute_plot_data_jaccard(progs, full_matrix=False)
+    assert "edges" in d
+    assert d["full_matrix"] is None
+
+
+def test_cache_integrity(tmp_path):
+    X = sparse.csr_matrix(np.abs(np.random.default_rng(0).normal(size=(100, 20))))
+    genes = [f"g{i}" for i in range(100)]
+    r1 = run_nmf_ranks(X, ranks=[2], gene_names=genes, hvg_mode="per_sample", cache_dir=tmp_path, nrun=1, max_iter=2)
+    r2 = run_nmf_ranks(X, ranks=[2], gene_names=genes, hvg_mode="per_sample", cache_dir=tmp_path, nrun=1, max_iter=2)
+    assert "robust_programs" in r2
+    assert "params" in r2
+    assert "version" in r2["params"]
+    assert r2["params"]["input_hash"] == r1["params"]["input_hash"]

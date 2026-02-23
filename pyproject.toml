@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastnmf"
+version = "0.2.1"
+description = "Cross R + Python single-cell NMF with robust programs and best MPs"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy", "pandas", "threadpoolctl"]
+
+[project.optional-dependencies]
+test = ["pytest", "anndata"]
+
+[project.scripts]
+nmf-mp = "fastnmf:cli_run"
+
+[tool.setuptools]
+py-modules = ["fastnmf"]

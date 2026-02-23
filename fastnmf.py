@@ -1,429 +1,616 @@
-"""Fast, vectorized Non-negative Matrix Factorization (NMF)."""
-
 from __future__ import annotations
 
-from contextlib import nullcontext
-from dataclasses import dataclass
-import os
+import argparse
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
-
-try:
-    from scipy import sparse
-    from scipy.sparse.linalg import svds
-except Exception:  # scipy is optional
-    sparse = None
-    svds = None
-
-try:
-    from threadpoolctl import threadpool_limits
-except Exception:  # optional dependency
-    threadpool_limits = None
+import pandas as pd
+from scipy import sparse
+from scipy.optimize import nnls
+from scipy.sparse import csr_matrix
+from threadpoolctl import threadpool_limits
 
 EPS = 1e-10
-ArrayLike = Union[np.ndarray, "sparse.spmatrix"]
+VERSION = "0.2.1"
+ArrayLike = Union[np.ndarray, sparse.spmatrix]
 
 
 @dataclass
-class NMFResult:
+class NMFFit:
     W: np.ndarray
     H: np.ndarray
-    reconstruction_err: float
+    loss_curve: List[float]
     n_iter: int
-    history: List[float]
-    elapsed_sec: float
+    runtime_sec: float
+    seed: int
+    backend: str
+    sparse_preserved_flag: bool
 
 
 @dataclass
-class KSelectionResult:
-    best_k: int
-    best_score: float
-    scores: Dict[int, float]
-    metric: str
+class Program:
+    program_id: str
+    sample_id: str
+    rank: int
+    idx: int
+    top_genes: List[str]
+    weights: Dict[str, float]
 
 
 @dataclass
-class GeneModuleResult:
-    modules: Dict[int, List[str]]
-    score_matrix: np.ndarray
+class RobustProgram:
+    robust_id: str
+    sample_id: str
+    member_program_ids: List[str]
+    support_distinct_k: int
+    consensus_top50: List[str]
 
 
-class FastNMF:
-    """Efficient NMF using multiplicative updates with practical speed knobs."""
+@dataclass
+class MetaProgram:
+    mp_id: str
+    consensus_top50: List[str]
+    member_program_ids: List[str]
+    support_programs: int
+    support_tumors: int
+    median_intra_jaccard: float
+    score: float
 
-    def __init__(
-        self,
-        n_components: int,
-        max_iter: int = 300,
-        tol: float = 1e-4,
-        init: Literal["nndsvd", "random"] = "nndsvd",
-        random_state: Optional[int] = None,
-        l2_reg: float = 0.0,
-        batch_size: Optional[int] = None,
-        check_every: int = 5,
-        patience: int = 3,
-        dtype: Union[np.dtype, str] = np.float64,
-        n_threads: Optional[int] = None,
-        max_memory_mb: Optional[float] = None,
-        verbose: bool = False,
-    ) -> None:
-        if n_components <= 0:
-            raise ValueError("n_components must be > 0")
-        if max_iter <= 0:
-            raise ValueError("max_iter must be > 0")
-        if check_every <= 0:
-            raise ValueError("check_every must be > 0")
-        if patience <= 0:
-            raise ValueError("patience must be > 0")
-        if init not in {"nndsvd", "random"}:
-            raise ValueError("init must be 'nndsvd' or 'random'")
-        if n_threads is not None and n_threads <= 0:
-            raise ValueError("n_threads must be > 0 when provided")
-        if max_memory_mb is not None and max_memory_mb <= 0:
-            raise ValueError("max_memory_mb must be > 0 when provided")
 
-        self.n_components = n_components
-        self.max_iter = max_iter
-        self.tol = tol
-        self.init = init
-        self.random_state = random_state
-        self.l2_reg = l2_reg
-        self.batch_size = batch_size
-        self.check_every = check_every
-        self.patience = patience
-        self.dtype = np.dtype(dtype)
-        self.n_threads = n_threads
-        self.max_memory_mb = max_memory_mb
-        self.verbose = verbose
+def parse_ranks(ranks: Union[str, Sequence[int], range, int]) -> List[int]:
+    if isinstance(ranks, int):
+        return [ranks]
+    if isinstance(ranks, range):
+        return list(ranks)
+    if isinstance(ranks, str):
+        x = ranks.strip()
+        if ":" in x:
+            p = [int(v) for v in x.split(":")]
+            if len(p) == 2:
+                return list(range(p[0], p[1] + 1))
+            if len(p) == 3:
+                return list(range(p[0], p[2] + (1 if p[1] > 0 else -1), p[1]))
+            raise ValueError("ranks must be start:end or start:step:end")
+        if "," in x:
+            return [int(v.strip()) for v in x.split(",") if v.strip()]
+        return [int(x)]
+    out = [int(v) for v in ranks]
+    if not out:
+        raise ValueError("ranks cannot be empty")
+    return out
 
-        self.W_: Optional[np.ndarray] = None
-        self.H_: Optional[np.ndarray] = None
-        self.history_: List[float] = []
 
-    def fit_transform(self, X: ArrayLike) -> np.ndarray:
-        result = self.factorize(X)
-        self.W_, self.H_, self.history_ = result.W, result.H, result.history
-        return self.W_
+def _to_csr(x: ArrayLike) -> csr_matrix:
+    if sparse.issparse(x):
+        return x.tocsr(copy=False)
+    return sparse.csr_matrix(np.asarray(x))
 
-    def fit(self, X: ArrayLike) -> "FastNMF":
-        self.fit_transform(X)
-        return self
 
-    def transform(self, X: ArrayLike, n_iter: int = 100) -> np.ndarray:
-        if self.H_ is None:
-            raise RuntimeError("Model is not fitted.")
-        X = _check_nonnegative(X, self.dtype)
-        m = X.shape[0]
-        rng = np.random.default_rng(self.random_state)
-        W = rng.random((m, self.n_components), dtype=self.dtype) + self.dtype.type(0.1)
-        H = self.H_
-        HHt = H @ H.T
-        for _ in range(n_iter):
-            numer = _matmul(X, H.T)
-            denom = W @ HHt + self.l2_reg * W + EPS
-            W *= numer / denom
-        return W
+def _hash_sparse_matrix(x: ArrayLike) -> str:
+    csr = _to_csr(x)
+    h = hashlib.sha256()
+    h.update(str(csr.shape).encode())
+    h.update(csr.indptr.tobytes())
+    h.update(csr.indices.tobytes())
+    h.update(csr.data.tobytes())
+    return h.hexdigest()
 
-    def inverse_transform(self, W: np.ndarray) -> np.ndarray:
-        if self.H_ is None:
-            raise RuntimeError("Model is not fitted.")
-        return W @ self.H_
 
-    def factorize(self, X: ArrayLike) -> NMFResult:
-        X = _check_nonnegative(X, self.dtype)
-        _, n = X.shape
-        start = perf_counter()
-        W, H = self._initialize(X)
+def adapt_input_anndata(adata: Any, prefer: Sequence[str] = ("counts", "raw", "X")) -> Tuple[ArrayLike, str, bool]:
+    for key in prefer:
+        if key == "counts" and hasattr(adata, "layers") and "counts" in adata.layers:
+            x = adata.layers["counts"]
+            return (x if sparse.issparse(x) else sparse.csr_matrix(x)), "layers[counts]", sparse.issparse(x)
+        if key == "raw" and getattr(adata, "raw", None) is not None:
+            x = adata.raw.X
+            return (x if sparse.issparse(x) else sparse.csr_matrix(x)), "raw.X", sparse.issparse(x)
+        if key == "X":
+            x = adata.X
+            return (x if sparse.issparse(x) else sparse.csr_matrix(x)), "X", sparse.issparse(x)
+    raise ValueError("No matrix source found in AnnData")
 
-        best = np.inf
-        stale = 0
-        history: List[float] = []
-        eff_batch_size = self._resolve_batch_size(X)
 
-        with _thread_ctx(self.n_threads):
-            for it in range(1, self.max_iter + 1):
-                wtw = W.T @ W
-                if eff_batch_size and eff_batch_size < n:
-                    for j0 in range(0, n, eff_batch_size):
-                        j1 = min(j0 + eff_batch_size, n)
-                        xb = X[:, j0:j1]
-                        numer = _matmul(W.T, xb)
-                        denom = wtw @ H[:, j0:j1] + self.l2_reg * H[:, j0:j1] + EPS
-                        H[:, j0:j1] *= numer / denom
+def _loss_trace(X: csr_matrix, W: np.ndarray, H: np.ndarray, x_norm_sq: float) -> float:
+    t1 = float(np.sum(W * (X @ H.T)))
+    wt_w = W.T @ W
+    hh_t = H @ H.T
+    t2 = float(np.sum(wt_w * hh_t))
+    val = x_norm_sq - 2.0 * t1 + t2
+    return max(0.0, val)
+
+
+def _update_mu(X: csr_matrix, W: np.ndarray, H: np.ndarray, l1_h: float) -> Tuple[np.ndarray, np.ndarray]:
+    H *= (W.T @ X) / (W.T @ W @ H + l1_h + EPS)
+    W *= (X @ H.T) / (W @ (H @ H.T) + EPS)
+    np.maximum(H, EPS, out=H)
+    np.maximum(W, EPS, out=W)
+    return W, H
+
+
+def _update_projgrad(X: csr_matrix, W: np.ndarray, H: np.ndarray, l1_h: float) -> Tuple[np.ndarray, np.ndarray]:
+    grad_h = W.T @ (W @ H) - (W.T @ X)
+    H -= 0.01 * grad_h
+    H -= l1_h
+    np.maximum(H, EPS, out=H)
+    grad_w = (W @ (H @ H.T)) - (X @ H.T)
+    W -= 0.01 * grad_w
+    np.maximum(W, EPS, out=W)
+    return W, H
+
+
+def nmf_fit(
+    x: ArrayLike,
+    k: int,
+    nrun: int = 10,
+    method: str = "mu",
+    max_iter: int = 500,
+    tol: float = 1e-4,
+    seed: int = 1,
+    warm_start: bool = True,
+    early_stop_patience: int = 10,
+    l1_h: float = 0.0,
+    return_loss: bool = True,
+    float32: bool = False,
+    init_wh: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    blas_threads: Optional[int] = None,
+) -> NMFFit:
+    if method not in {"mu", "projgrad"}:
+        raise ValueError("method must be one of {'mu','projgrad'}")
+    X = _to_csr(x)
+    dtype = np.float32 if float32 else np.float64
+    m, n = X.shape
+    x_norm_sq = float(np.dot(X.data, X.data))
+    sparse_flag = sparse.issparse(x)
+
+    best_fit: Optional[NMFFit] = None
+    best_loss = np.inf
+
+    with threadpool_limits(limits=blas_threads):
+        for run_idx in range(nrun):
+            rng = np.random.default_rng(seed + run_idx)
+            if init_wh is not None and warm_start:
+                W, H = init_wh
+                W = np.maximum(W[:, : min(k, W.shape[1])].astype(dtype, copy=True), EPS)
+                H = np.maximum(H[: min(k, H.shape[0]), :].astype(dtype, copy=True), EPS)
+                if W.shape[1] < k:
+                    W = np.pad(W, ((0, 0), (0, k - W.shape[1])), mode="edge")
+                if H.shape[0] < k:
+                    H = np.pad(H, ((0, k - H.shape[0]), (0, 0)), mode="edge")
+            else:
+                W = rng.random((m, k), dtype=dtype) + EPS
+                H = rng.random((k, n), dtype=dtype) + EPS
+
+            start = perf_counter()
+            loss_curve: List[float] = []
+            stale = 0
+            prev = np.inf
+            for it in range(1, max_iter + 1):
+                if method == "mu":
+                    W, H = _update_mu(X, W, H, l1_h)
                 else:
-                    numer = _matmul(W.T, X)
-                    denom = wtw @ H + self.l2_reg * H + EPS
-                    H *= numer / denom
+                    W, H = _update_projgrad(X, W, H, l1_h)
 
-                hht = H @ H.T
-                numer = _matmul(X, H.T)
-                denom = W @ hht + self.l2_reg * W + EPS
-                W *= numer / denom
-
-                if it % self.check_every != 0 and it != self.max_iter:
-                    continue
-
-                err = _fro_error(X, W, H)
-                history.append(err)
-                if self.verbose:
-                    print(f"iter={it:4d} err={err:.6e}")
-                rel_improve = (best - err) / max(best, EPS)
-                if rel_improve < self.tol:
-                    stale += 1
-                else:
-                    stale = 0
-                    best = err
-                if stale >= self.patience:
+                cur = _loss_trace(X, W, H, x_norm_sq)
+                if return_loss:
+                    loss_curve.append(cur)
+                rel = (prev - cur) / max(prev, EPS)
+                stale = stale + 1 if rel < tol else 0
+                prev = cur
+                if stale >= early_stop_patience:
                     break
 
-        elapsed = perf_counter() - start
-        final_err = history[-1] if history else _fro_error(X, W, H)
-        return NMFResult(W=W, H=H, reconstruction_err=final_err, n_iter=it, history=history, elapsed_sec=elapsed)
-
-    def select_k(
-        self,
-        X: ArrayLike,
-        k_values: Sequence[int],
-        metric: Literal["reconstruction", "bic"] = "reconstruction",
-    ) -> KSelectionResult:
-        X = _check_nonnegative(X, self.dtype)
-        ks = sorted(set(int(k) for k in k_values))
-        if not ks:
-            raise ValueError("k_values must not be empty")
-
-        m, n = X.shape
-        scores: Dict[int, float] = {}
-        best_k, best_score = ks[0], np.inf
-
-        for k in ks:
-            if k <= 0 or k > min(m, n):
-                raise ValueError(f"Invalid k={k}; must be in [1, {min(m, n)}]")
-            model = FastNMF(
-                n_components=k,
-                max_iter=self.max_iter,
-                tol=self.tol,
-                init=self.init,
-                random_state=self.random_state,
-                l2_reg=self.l2_reg,
-                batch_size=self.batch_size,
-                check_every=self.check_every,
-                patience=self.patience,
-                dtype=self.dtype,
-                n_threads=self.n_threads,
-                max_memory_mb=self.max_memory_mb,
-                verbose=False,
+            fit = NMFFit(
+                W=W,
+                H=H,
+                loss_curve=loss_curve,
+                n_iter=it,
+                runtime_sec=perf_counter() - start,
+                seed=seed + run_idx,
+                backend=method,
+                sparse_preserved_flag=sparse_flag,
             )
-            res = model.factorize(X)
-            err = res.reconstruction_err
-            if metric == "reconstruction":
-                score = err
-            elif metric == "bic":
-                params = k * (m + n)
-                sigma2 = max((err**2) / max(m * n, 1), EPS)
-                ll_approx = -0.5 * m * n * np.log(sigma2)
-                score = -2.0 * ll_approx + params * np.log(max(m * n, 2))
-            else:
-                raise ValueError("metric must be 'reconstruction' or 'bic'")
-            scores[k] = float(score)
-            if score < best_score:
-                best_k, best_score = k, float(score)
+            final_loss = loss_curve[-1] if loss_curve else np.inf
+            if final_loss < best_loss:
+                best_loss = final_loss
+                best_fit = fit
 
-        return KSelectionResult(best_k=best_k, best_score=best_score, scores=scores, metric=metric)
+    assert best_fit is not None
+    return best_fit
 
-    def fit_best_k(
-        self,
-        X: ArrayLike,
-        k_values: Sequence[int],
-        metric: Literal["reconstruction", "bic"] = "bic",
-    ) -> Tuple[KSelectionResult, NMFResult]:
-        sel = self.select_k(X, k_values, metric=metric)
-        best = FastNMF(
-            n_components=sel.best_k,
-            max_iter=self.max_iter,
-            tol=self.tol,
-            init=self.init,
-            random_state=self.random_state,
-            l2_reg=self.l2_reg,
-            batch_size=self.batch_size,
-            check_every=self.check_every,
-            patience=self.patience,
-            dtype=self.dtype,
-            n_threads=self.n_threads,
-            max_memory_mb=self.max_memory_mb,
-            verbose=self.verbose,
+
+def fit_global_hvg(samples: Dict[str, Tuple[ArrayLike, List[str]]], top_genes: int = 7000) -> List[str]:
+    if not samples:
+        raise ValueError("samples cannot be empty")
+    common = None
+    for _, (_, genes) in samples.items():
+        s = set(genes)
+        common = s if common is None else (common & s)
+    common = sorted(common or [])
+    if not common:
+        raise ValueError("No common genes across samples")
+
+    var_sum = np.zeros(len(common), dtype=float)
+    idx_ref = {g: i for i, g in enumerate(common)}
+    for _, (x, genes) in samples.items():
+        csr = _to_csr(x)
+        gidx = [genes.index(g) for g in common]
+        sub = csr[gidx, :]
+        mean = np.asarray(sub.mean(axis=1)).ravel()
+        sq_mean = np.asarray(sub.multiply(sub).mean(axis=1)).ravel()
+        var_sum += (sq_mean - mean * mean)
+    order = np.argsort(-var_sum)[: min(top_genes, len(common))]
+    return [common[i] for i in order]
+
+
+def _select_genes_by_reference(x: ArrayLike, gene_names: List[str], reference_genes: List[str]) -> Tuple[csr_matrix, List[str]]:
+    csr = _to_csr(x)
+    idx_map = {g: i for i, g in enumerate(gene_names)}
+    rows = []
+    for g in reference_genes:
+        if g in idx_map:
+            rows.append(csr[idx_map[g], :])
+        else:
+            rows.append(sparse.csr_matrix((1, csr.shape[1])))
+    return sparse.vstack(rows, format="csr"), list(reference_genes)
+
+
+def _top_variable_genes_per_sample(x: ArrayLike, gene_names: List[str], top_genes: int) -> Tuple[csr_matrix, List[str]]:
+    csr = _to_csr(x)
+    mean = np.asarray(csr.mean(axis=1)).ravel()
+    sq_mean = np.asarray(csr.multiply(csr).mean(axis=1)).ravel()
+    var = sq_mean - mean * mean
+    idx = np.argsort(-var)[: min(top_genes, csr.shape[0])]
+    return csr[idx, :], [gene_names[i] for i in idx]
+
+
+def _programs_from_fit(fit: NMFFit, rank: int, sample_id: str, genes: List[str], topN: int) -> List[Program]:
+    out: List[Program] = []
+    for j in range(rank):
+        w = fit.W[:, j]
+        idx = np.argsort(-w)[:topN]
+        top = [genes[i] for i in idx]
+        out.append(
+            Program(
+                program_id=f"{sample_id}|K{rank}_P{j+1}",
+                sample_id=sample_id,
+                rank=rank,
+                idx=j + 1,
+                top_genes=top,
+                weights={genes[i]: float(w[i]) for i in idx},
+            )
         )
-        res = best.factorize(X)
-        self.n_components = sel.best_k
-        self.W_, self.H_, self.history_ = res.W, res.H, res.history
-        return sel, res
-
-    def extract_gene_modules_3ca(
-        self,
-        gene_names: Sequence[str],
-        top_n: int = 50,
-        min_specificity: float = 1.5,
-    ) -> GeneModuleResult:
-        if self.H_ is None:
-            raise RuntimeError("Model is not fitted.")
-        return extract_gene_modules_3ca(self.H_, gene_names, top_n, min_specificity)
-
-    def _resolve_batch_size(self, X: ArrayLike) -> Optional[int]:
-        _, n = X.shape
-        if self.max_memory_mb is None:
-            return self.batch_size
-        itemsize = np.dtype(self.dtype).itemsize
-        m = X.shape[0]
-        k = self.n_components
-        bytes_per_col = (m + 3 * k) * itemsize
-        budget = int(self.max_memory_mb * 1024 * 1024)
-        auto_batch = max(1, budget // max(bytes_per_col, 1))
-        auto_batch = min(auto_batch, n)
-        return auto_batch if self.batch_size is None else min(self.batch_size, auto_batch)
-
-    def _initialize(self, X: ArrayLike) -> Tuple[np.ndarray, np.ndarray]:
-        m, n = X.shape
-        k = self.n_components
-        if k > min(m, n):
-            raise ValueError("n_components must be <= min(n_samples, n_features)")
-        rng = np.random.default_rng(self.random_state)
-        if self.init == "random":
-            avg = np.sqrt(max(_mean_value(X), EPS) / max(k, 1))
-            return avg * rng.random((m, k), dtype=self.dtype) + EPS, avg * rng.random((k, n), dtype=self.dtype) + EPS
-
-        U, S, VT = _topk_svd(X, k)
-        W = np.zeros((m, k), dtype=self.dtype)
-        H = np.zeros((k, n), dtype=self.dtype)
-        W[:, 0] = np.sqrt(S[0]) * np.maximum(U[:, 0], 0)
-        H[0, :] = np.sqrt(S[0]) * np.maximum(VT[0, :], 0)
-        for j in range(1, k):
-            uj, vj = U[:, j], VT[j, :]
-            u_pos, u_neg = np.maximum(uj, 0), np.maximum(-uj, 0)
-            v_pos, v_neg = np.maximum(vj, 0), np.maximum(-vj, 0)
-            upn, unn = np.linalg.norm(u_pos), np.linalg.norm(u_neg)
-            vpn, vnn = np.linalg.norm(v_pos), np.linalg.norm(v_neg)
-            n_pos, n_neg = upn * vpn, unn * vnn
-            if n_pos >= n_neg:
-                W[:, j] = np.sqrt(S[j] * n_pos) * (u_pos / (upn + EPS))
-                H[j, :] = np.sqrt(S[j] * n_pos) * (v_pos / (vpn + EPS))
-            else:
-                W[:, j] = np.sqrt(S[j] * n_neg) * (u_neg / (unn + EPS))
-                H[j, :] = np.sqrt(S[j] * n_neg) * (v_neg / (vnn + EPS))
-        W[W <= 0] = EPS
-        H[H <= 0] = EPS
-        return W, H
+    return out
 
 
-def extract_gene_modules_3ca(
-    H: np.ndarray,
-    gene_names: Sequence[str],
-    top_n: int = 50,
-    min_specificity: float = 1.5,
-) -> GeneModuleResult:
-    """3CA-style module extraction from factor loadings.
+def _jaccard(a: Iterable[str], b: Iterable[str]) -> float:
+    sa, sb = set(a), set(b)
+    return len(sa & sb) / max(1, len(sa | sb))
 
-    Uses per-gene dominant-factor specificity ratio and keeps top genes per module.
-    """
-    H = np.asarray(H, dtype=np.float64)
-    if H.ndim != 2:
-        raise ValueError("H must be 2D: [k, n_genes]")
-    k, n_genes = H.shape
-    if len(gene_names) != n_genes:
-        raise ValueError("gene_names length must equal H.shape[1]")
 
-    denom = np.partition(H, kth=max(k - 2, 0), axis=0)[max(k - 2, 0), :] + EPS if k > 1 else np.ones(n_genes)
-    dominant = np.argmax(H, axis=0)
-    maxv = H[dominant, np.arange(n_genes)]
-    specificity = maxv / denom
+def _candidate_pairs(sets: List[Set[str]]) -> Set[Tuple[int, int]]:
+    inv: Dict[str, List[int]] = {}
+    for i, s in enumerate(sets):
+        for g in s:
+            inv.setdefault(g, []).append(i)
+    pairs: Set[Tuple[int, int]] = set()
+    for ids in inv.values():
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                if a > b:
+                    a, b = b, a
+                pairs.add((a, b))
+    return pairs
 
-    modules: Dict[int, List[str]] = {}
-    score = H.copy()
-    for c in range(k):
-        idx = np.where((dominant == c) & (specificity >= min_specificity))[0]
-        if idx.size == 0:
-            modules[c] = []
+
+def _components(adj: List[List[int]]) -> List[List[int]]:
+    seen = [False] * len(adj)
+    out: List[List[int]] = []
+    for i in range(len(adj)):
+        if seen[i]:
             continue
-        order = idx[np.argsort(H[c, idx])[::-1]]
-        keep = order[:top_n]
-        modules[c] = [str(gene_names[i]) for i in keep]
-    return GeneModuleResult(modules=modules, score_matrix=score)
+        st = [i]
+        seen[i] = True
+        comp = []
+        while st:
+            cur = st.pop()
+            comp.append(cur)
+            for nb in adj[cur]:
+                if not seen[nb]:
+                    seen[nb] = True
+                    st.append(nb)
+        out.append(comp)
+    return out
 
 
-def _topk_svd(X: ArrayLike, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if sparse is not None and sparse.issparse(X) and svds is not None:
-        U, S, VT = svds(X, k=k)
-        order = np.argsort(S)[::-1]
-        return U[:, order], S[order], VT[order, :]
-    U, S, VT = np.linalg.svd(_to_dense(X), full_matrices=False)
-    return U[:, :k], S[:k], VT[:k, :]
+def build_robust_programs(
+    programs: List[Program],
+    sample_intra_min_jaccard: float = 0.35,
+    require_distinct_k_support: int = 2,
+    min_cluster_size_programs: int = 2,
+) -> List[RobustProgram]:
+    sets = [set(p.top_genes) for p in programs]
+    adj = [[] for _ in programs]
+    for i, j in _candidate_pairs(sets):
+        if _jaccard(sets[i], sets[j]) >= sample_intra_min_jaccard:
+            adj[i].append(j)
+            adj[j].append(i)
+    out: List[RobustProgram] = []
+    for comp in _components(adj):
+        if len(comp) < min_cluster_size_programs:
+            continue
+        ks = {programs[i].rank for i in comp}
+        if len(ks) < require_distinct_k_support:
+            continue
+        freq: Dict[str, int] = {}
+        wsum: Dict[str, float] = {}
+        for i in comp:
+            for g in programs[i].top_genes:
+                freq[g] = freq.get(g, 0) + 1
+                wsum[g] = wsum.get(g, 0.0) + programs[i].weights.get(g, 0.0)
+        consensus = sorted(freq.keys(), key=lambda g: (-freq[g], -wsum[g], g))[:50]
+        out.append(
+            RobustProgram(
+                robust_id=f"{programs[comp[0]].sample_id}_RP{len(out)+1}",
+                sample_id=programs[comp[0]].sample_id,
+                member_program_ids=[programs[i].program_id for i in comp],
+                support_distinct_k=len(ks),
+                consensus_top50=consensus,
+            )
+        )
+    return out
 
 
-def _check_nonnegative(X: ArrayLike, dtype: np.dtype) -> ArrayLike:
-    if sparse is not None and sparse.issparse(X):
-        X = X.astype(dtype)
-        if X.data.size and X.data.min() < 0:
-            raise ValueError("X must be non-negative")
-        return X
-    X = np.asarray(X, dtype=dtype)
-    if np.min(X) < 0:
-        raise ValueError("X must be non-negative")
-    return X
+def build_cohort_mps(
+    robust_programs_by_sample: Dict[str, List[RobustProgram]],
+    inter_min_jaccard_for_edge: float = 0.30,
+    mp_min_programs: int = 20,
+    mp_min_tumors: int = 12,
+    mp_median_intra_jaccard: float = 0.30,
+    redundancy_jaccard: float = 0.50,
+) -> Tuple[List[MetaProgram], List[MetaProgram]]:
+    all_rp = [rp for v in robust_programs_by_sample.values() for rp in v]
+    if len(robust_programs_by_sample) < 2 or len(all_rp) == 0:
+        return [], []
+
+    sets = [set(rp.consensus_top50) for rp in all_rp]
+    adj = [[] for _ in all_rp]
+    for i, j in _candidate_pairs(sets):
+        if _jaccard(sets[i], sets[j]) >= inter_min_jaccard_for_edge:
+            adj[i].append(j)
+            adj[j].append(i)
+
+    mps: List[MetaProgram] = []
+    for comp in _components(adj):
+        members = [all_rp[i] for i in comp]
+        tumors = {m.sample_id for m in members}
+        if len(members) < mp_min_programs or len(tumors) < mp_min_tumors:
+            continue
+        pairs = []
+        for a in range(len(comp)):
+            for b in range(a + 1, len(comp)):
+                pairs.append(_jaccard(sets[comp[a]], sets[comp[b]]))
+        med = float(np.median(pairs)) if pairs else 1.0
+        if med < mp_median_intra_jaccard:
+            continue
+        freq: Dict[str, int] = {}
+        for m in members:
+            for g in m.consensus_top50:
+                freq[g] = freq.get(g, 0) + 1
+        cons = sorted(freq, key=lambda g: (-freq[g], g))[:50]
+        score = len(tumors) * med * math.log1p(len(members))
+        mps.append(
+            MetaProgram(
+                mp_id=f"MP{len(mps)+1}",
+                consensus_top50=cons,
+                member_program_ids=[pid for m in members for pid in m.member_program_ids],
+                support_programs=len(members),
+                support_tumors=len(tumors),
+                median_intra_jaccard=med,
+                score=score,
+            )
+        )
+
+    best: List[MetaProgram] = []
+    for mp in sorted(mps, key=lambda z: z.score, reverse=True):
+        if any(_jaccard(mp.consensus_top50, b.consensus_top50) >= redundancy_jaccard for b in best):
+            continue
+        best.append(mp)
+    return mps, best
 
 
-def _to_dense(X: ArrayLike) -> np.ndarray:
-    if sparse is not None and sparse.issparse(X):
-        return X.toarray()
-    return np.asarray(X)
+def run_nmf_ranks(
+    obj_or_matrix: ArrayLike,
+    ranks: Union[str, Sequence[int], range, int] = range(4, 10),
+    top_genes: int = 7000,
+    topN: int = 50,
+    sample_id: str = "sample1",
+    gene_names: Optional[List[str]] = None,
+    hvg_mode: str = "global_fixed",
+    reference_genes: Optional[List[str]] = None,
+    cache_dir: Optional[Union[str, Path]] = None,
+    version: str = VERSION,
+    **nmf_kwargs: Any,
+) -> Dict[str, Any]:
+    if hvg_mode not in {"global_fixed", "per_sample"}:
+        raise ValueError("hvg_mode must be global_fixed or per_sample")
+    if gene_names is None:
+        raise ValueError("gene_names is required")
+
+    X = _to_csr(obj_or_matrix)
+    if hvg_mode == "global_fixed":
+        if reference_genes is None:
+            raise ValueError("global_fixed requires reference_genes")
+        Xs, genes = _select_genes_by_reference(X, gene_names, reference_genes)
+    else:
+        Xs, genes = _top_variable_genes_per_sample(X, gene_names, top_genes)
+
+    rr = parse_ranks(ranks)
+    payload = {
+        "sample_id": sample_id,
+        "ranks": rr,
+        "top_genes": top_genes,
+        "topN": topN,
+        "hvg_mode": hvg_mode,
+        "seed": nmf_kwargs.get("seed", 1),
+        "version": version,
+        "input_hash": _hash_sparse_matrix(X),
+    }
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    if cache_dir:
+        cpath = Path(cache_dir) / f"{sample_id}_{key}.json"
+        if cpath.exists():
+            data = json.loads(cpath.read_text())
+            return data
+
+    fits: Dict[int, NMFFit] = {}
+    warm = None
+    programs: List[Program] = []
+    for k in rr:
+        fit = nmf_fit(Xs, k=k, init_wh=warm, **nmf_kwargs)
+        fits[k] = fit
+        warm = (fit.W, fit.H)
+        programs.extend(_programs_from_fit(fit, k, sample_id, genes, topN))
+
+    robust = build_robust_programs(programs)
+    basis = np.concatenate([fits[k].W for k in rr], axis=1)
+    program_names = [f"K{k}_P{i+1}" for k in rr for i in range(k)]
+
+    out = {
+        "sample_id": sample_id,
+        "genes_nmf_w_basis": basis.tolist(),
+        "genes": genes,
+        "program_names": program_names,
+        "robust_programs": [asdict(r) for r in robust],
+        "params": {
+            **payload,
+            "sample_intra_min_jaccard": 0.35,
+            "require_distinct_k_support": 2,
+            "min_cluster_size_programs": 2,
+            "inter_min_jaccard_for_edge": 0.30,
+            "mp_min_programs": 20,
+            "mp_min_tumors": 12,
+            "mp_median_intra_jaccard": 0.30,
+            "cache_source": "computed",
+        },
+    }
+    if cache_dir:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        cpath = Path(cache_dir) / f"{sample_id}_{key}.json"
+        cpath.write_text(json.dumps(out))
+    return out
 
 
-def _matmul(A: ArrayLike, B: np.ndarray) -> np.ndarray:
-    return A @ B
+def compute_plot_data_jaccard(
+    items: Sequence[Union[Program, RobustProgram, MetaProgram, Dict[str, Any]]],
+    entity: str = "program",
+    topN: int = 50,
+    full_matrix: bool = False,
+    max_entities_for_full: int = 2000,
+) -> Dict[str, Any]:
+    ids = []
+    sets = []
+    for i, item in enumerate(items):
+        if isinstance(item, Program):
+            ids.append(item.program_id)
+            sets.append(set(item.top_genes[:topN]))
+        elif isinstance(item, RobustProgram):
+            ids.append(item.robust_id)
+            sets.append(set(item.consensus_top50[:topN]))
+        elif isinstance(item, MetaProgram):
+            ids.append(item.mp_id)
+            sets.append(set(item.consensus_top50[:topN]))
+        else:
+            ids.append(str(item.get("id", f"item_{i}")))
+            sets.append(set(item.get("consensus_top50", item.get("top_genes", []))[:topN]))
+
+    edges = []
+    for i, j in _candidate_pairs(sets):
+        jv = _jaccard(sets[i], sets[j])
+        if jv > 0:
+            edges.append((i, j, jv, 1 - jv))
+    edge_df = pd.DataFrame(edges, columns=["i", "j", "jaccard", "distance"])
+
+    data: Dict[str, Any] = {
+        "entity": entity,
+        "ids": ids,
+        "edges": edge_df,
+        "order": list(range(len(ids))),
+        "annotations": {},
+        "full_matrix": None,
+    }
+
+    if full_matrix:
+        if len(ids) > max_entities_for_full:
+            raise ValueError("too many entities for full heatmap")
+        mat = np.eye(len(ids), dtype=float)
+        for i, j, jv, _ in edges:
+            mat[i, j] = jv
+            mat[j, i] = jv
+        data["full_matrix"] = mat
+    return data
 
 
-def _mean_value(X: ArrayLike) -> float:
-    if sparse is not None and sparse.issparse(X):
-        return float(X.sum()) / (X.shape[0] * X.shape[1])
-    return float(np.mean(X))
+def save_plot_data_jaccard(plot_data: Dict[str, Any], out_dir: Union[str, Path], prefix: str) -> None:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    plot_data["edges"].to_csv(out / f"{prefix}_edges.csv", index=False)
+    meta = {"entity": plot_data["entity"], "ids": plot_data["ids"], "order": plot_data["order"]}
+    (out / f"{prefix}_metadata.json").write_text(json.dumps(meta, indent=2))
 
 
-def _fro_error(X: ArrayLike, W: np.ndarray, H: np.ndarray) -> float:
-    if sparse is not None and sparse.issparse(X):
-        x_f2 = float(X.multiply(X).sum())
-        xtw = X.T @ W
-        cross = float(np.sum(H * xtw.T))
-        wh_f2 = float(np.sum((W @ H) ** 2))
-        return float(np.sqrt(max(x_f2 - 2.0 * cross + wh_f2, 0.0)))
-    return float(np.linalg.norm(X - W @ H, ord="fro"))
+def cli_run() -> None:
+    p = argparse.ArgumentParser(prog="nmf-mp")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    run = sp.add_parser("run")
+    run.add_argument("--input", required=True)
+    run.add_argument("--format", required=True, choices=["h5ad", "npy", "npz"])
+    run.add_argument("--layer", default="counts")
+    run.add_argument("--ranks", default="4:9")
+    run.add_argument("--top-genes", type=int, default=7000)
+    run.add_argument("--topN", type=int, default=50)
+    run.add_argument("--hvg-mode", default="global_fixed", choices=["global_fixed", "per_sample"])
+    run.add_argument("--reference-genes", default=None)
+    run.add_argument("--out", required=True)
+    args = p.parse_args()
 
+    if args.format == "h5ad":
+        import anndata as ad
 
-def _thread_ctx(n_threads: Optional[int]):
-    if n_threads is None:
-        return nullcontext()
-    if threadpool_limits is not None:
-        return threadpool_limits(limits=n_threads)
-    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-        os.environ[var] = str(n_threads)
-    return nullcontext()
+        adata = ad.read_h5ad(args.input)
+        X, _, _ = adapt_input_anndata(adata)
+        genes = list(map(str, adata.var_names))
+    elif args.format == "npy":
+        X = np.load(args.input)
+        genes = [f"gene_{i}" for i in range(X.shape[0])]
+    else:
+        X = sparse.load_npz(args.input)
+        genes = [f"gene_{i}" for i in range(X.shape[0])]
 
+    ref = None
+    if args.reference_genes:
+        ref = [x.strip() for x in Path(args.reference_genes).read_text().splitlines() if x.strip()]
 
-def benchmark(seed: int = 42) -> Dict[str, float]:
-    rng = np.random.default_rng(seed)
-    m, n, k = 1200, 600, 20
-    X = rng.random((m, k)) @ rng.random((k, n))
-    model = FastNMF(n_components=k, max_iter=100, tol=1e-5, init="nndsvd", check_every=4, random_state=seed)
-    res = model.factorize(X)
-    return {"iter": float(res.n_iter), "recon_err": res.reconstruction_err, "elapsed_sec": res.elapsed_sec}
-
-
-def benchmark_k_selection(seed: int = 42) -> Dict[str, float]:
-    rng = np.random.default_rng(seed)
-    m, n, k_true = 1200, 600, 24
-    X = rng.random((m, k_true)) @ rng.random((k_true, n)) + 0.01 * rng.random((m, n))
-    base = FastNMF(n_components=8, max_iter=80, tol=1e-4, init="nndsvd", check_every=4, random_state=seed)
-    sel = base.select_k(X, k_values=range(12, 37, 6), metric="bic")
-    return {"best_k": float(sel.best_k), "best_score": sel.best_score}
+    out = run_nmf_ranks(
+        X,
+        ranks=args.ranks,
+        top_genes=args.top_genes,
+        topN=args.topN,
+        gene_names=genes,
+        hvg_mode=args.hvg_mode,
+        reference_genes=ref,
+    )
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "result.json").write_text(json.dumps(out))
 
 
 if __name__ == "__main__":
-    print({"benchmark": benchmark(), "k_selection": benchmark_k_selection()})
+    cli_run()

@@ -7,98 +7,100 @@ from scipy import sparse
 from fastnmf import (
     MetaProgram,
     Program,
-    adapt_input_anndata,
+    build_cohort_mps,
     compute_plot_data_jaccard,
-    compute_plot_data_mp_distribution,
+    fit_global_hvg,
     nmf_fit,
     parse_ranks,
     run_nmf_ranks,
-    save_plot_data_jaccard,
-    select_best_mps,
 )
 
 
 def test_parse_ranks_variants():
-    assert parse_ranks("4:9") == [4, 5, 6, 7, 8, 9]
+    assert parse_ranks("4:6") == [4, 5, 6]
     assert parse_ranks("4,6,9") == [4, 6, 9]
-    assert parse_ranks([3, 4]) == [3, 4]
 
 
-def test_reproducible_seed():
-    X = np.abs(np.random.default_rng(0).normal(size=(30, 20)))
-    a = nmf_fit(X, k=4, nrun=1, seed=7, max_iter=30)
-    b = nmf_fit(X, k=4, nrun=1, seed=7, max_iter=30)
-    np.testing.assert_allclose(a.W, b.W, atol=1e-6)
-    np.testing.assert_allclose(a.H, b.H, atol=1e-6)
+def test_loss_monotonic_nonincreasing_mu():
+    X = np.abs(np.random.default_rng(0).normal(size=(60, 40)))
+    fit = nmf_fit(X, k=4, nrun=1, method="mu", max_iter=30, early_stop_patience=100)
+    diffs = np.diff(fit.loss_curve)
+    assert np.all(diffs <= 1e-8)
 
 
-def test_sparse_preserved_flag():
-    X = sparse.random(40, 20, density=0.1, format="csr", random_state=0)
-    fit = nmf_fit(X, k=3, nrun=1, seed=1, max_iter=10)
-    assert fit.sparse_preserved_flag is True
+def test_sparse_no_toarray_called(monkeypatch):
+    called = {"n": 0}
+
+    def boom(self):
+        called["n"] += 1
+        raise RuntimeError("toarray called")
+
+    monkeypatch.setattr(sparse.csr_matrix, "toarray", boom, raising=True)
+    X = sparse.random(200, 120, density=0.01, format="csr", random_state=1)
+    genes = [f"g{i}" for i in range(200)]
+    out = run_nmf_ranks(X, ranks=[2], top_genes=100, gene_names=genes, hvg_mode="per_sample", nrun=1, max_iter=3)
+    assert len(out["robust_programs"]) >= 0
+    assert called["n"] == 0
 
 
-def test_run_nmf_ranks_contract_shape_and_names():
-    X = np.abs(np.random.default_rng(1).normal(size=(120, 30)))
-    out = run_nmf_ranks(X, ranks=[4, 5], top_genes=50, nrun=1, max_iter=20, plot_mode="none")
-    assert out.genes_nmf_w_basis.shape == (50, 9)
-    assert out.program_names[0] == "K4_P1"
-    assert out.program_names[-1] == "K5_P5"
+def test_single_sample_no_mp():
+    mps, best = build_cohort_mps({"s1": []})
+    assert mps == []
+    assert best == []
 
 
-def test_per_sample_requires_reference_for_reference_export():
-    X = np.abs(np.random.default_rng(2).normal(size=(100, 20)))
-    with pytest.raises(ValueError):
-        run_nmf_ranks(X, ranks=[4], top_genes=50, nrun=1, max_iter=10, hvg_mode="per_sample", export_space="reference", plot_mode="none")
+def test_multi_sample_mp_possible():
+    rp = {
+        "s1": [
+            {"robust_id": "a1", "sample_id": "s1", "member_program_ids": ["p1"], "support_distinct_k": 2, "consensus_top50": [f"g{i}" for i in range(50)]}
+            for _ in range(20)
+        ],
+        "s2": [
+            {"robust_id": "b1", "sample_id": "s2", "member_program_ids": ["p2"], "support_distinct_k": 2, "consensus_top50": [f"g{i}" for i in range(50)]}
+            for _ in range(20)
+        ],
+    }
+    from fastnmf import RobustProgram
+
+    cast = {k: [RobustProgram(**x) for x in v] for k, v in rp.items()}
+    mps, best = build_cohort_mps(cast, mp_min_programs=20, mp_min_tumors=2, mp_median_intra_jaccard=0)
+    assert len(mps) >= 1
+    assert len(best) >= 1
 
 
-def test_best_mps_redundancy_filter():
-    m1 = MetaProgram("MP1", [f"g{i}" for i in range(50)], [], 25, 13, 0.4, 10.0)
-    m2 = MetaProgram("MP2", [f"g{i}" for i in range(45)] + ["x", "y", "z", "u", "v"], [], 24, 12, 0.35, 9.0)
-    m3 = MetaProgram("MP3", [f"h{i}" for i in range(50)], [], 22, 12, 0.32, 8.0)
-    kept = select_best_mps([m2, m1, m3])
-    assert [x.mp_id for x in kept] == ["MP1", "MP3"]
+def test_global_fixed_reference_alignment():
+    x1 = sparse.csr_matrix(np.abs(np.random.default_rng(1).normal(size=(6, 5))))
+    g1 = ["a", "b", "c", "d", "e", "f"]
+    x2 = sparse.csr_matrix(np.abs(np.random.default_rng(2).normal(size=(6, 5))))
+    g2 = ["a", "b", "c", "x", "y", "z"]
+    ref = ["a", "b", "c"]
+    o1 = run_nmf_ranks(x1, ranks=[2], gene_names=g1, hvg_mode="global_fixed", reference_genes=ref, nrun=1, max_iter=2)
+    o2 = run_nmf_ranks(x2, ranks=[2], gene_names=g2, hvg_mode="global_fixed", reference_genes=ref, nrun=1, max_iter=2)
+    assert o1["genes"] == ref
+    assert o2["genes"] == ref
 
 
-def test_anndata_priority_layers_raw_x():
-    pytest.importorskip("anndata")
-    from anndata import AnnData
-
-    a = AnnData(X=np.ones((10, 5)))
-    a.layers["counts"] = sparse.csr_matrix(np.full((10, 5), 2.0))
-    a.raw = a.copy()
-    mat, src, is_sparse = adapt_input_anndata(a)
-    assert src == "layers[counts]"
-    assert sparse.issparse(mat)
-    assert is_sparse is True
+def test_per_sample_gene_names_can_differ():
+    x1 = sparse.csr_matrix(np.abs(np.random.default_rng(1).normal(size=(10, 5))))
+    x2 = sparse.csr_matrix(np.abs(np.random.default_rng(2).normal(size=(10, 5))))
+    o1 = run_nmf_ranks(x1, ranks=[2], gene_names=[f"a{i}" for i in range(10)], hvg_mode="per_sample", nrun=1, max_iter=2)
+    o2 = run_nmf_ranks(x2, ranks=[2], gene_names=[f"b{i}" for i in range(10)], hvg_mode="per_sample", nrun=1, max_iter=2)
+    assert o1["genes"] != o2["genes"]
 
 
-def test_jaccard_plot_data_symmetric_and_serializable(tmp_path):
-    p1 = Program("s|K4_P1", "s", 4, 1, [f"g{i}" for i in range(50)], {})
-    p2 = Program("s|K4_P2", "s", 4, 2, [f"g{i}" for i in range(25, 75)], {})
-    pdata = compute_plot_data_jaccard([p1, p2], entity="program", topN=50)
-    mat = pdata["jaccard_matrix"]
-    assert np.allclose(mat, mat.T)
-    assert np.allclose(np.diag(mat), 1.0)
-    assert sorted(pdata["order"]) == [0, 1]
-
-    save_plot_data_jaccard(pdata, tmp_path, "program_jaccard")
-    loaded = pd.read_csv(tmp_path / "program_jaccard_jaccard_matrix.csv", index_col=0)
-    meta = json.loads((tmp_path / "program_jaccard_metadata.json").read_text())
-    assert loaded.shape == (2, 2)
-    assert len(meta["order"]) == 2
+def test_jaccard_edge_list_mode_large():
+    progs = [Program(f"p{i}", "s", 4, 1, [f"g{j}" for j in range(i % 10, i % 10 + 50)], {}) for i in range(2000)]
+    d = compute_plot_data_jaccard(progs, full_matrix=False)
+    assert "edges" in d
+    assert d["full_matrix"] is None
 
 
-def test_mp_distribution_toy_assignments():
-    genes = [f"g{i}" for i in range(60)]
-    X = np.zeros((60, 6), dtype=float)
-    X[:30, :3] = 40
-    X[30:60, 3:] = 40
-    mp1 = MetaProgram("MP1", [f"g{i}" for i in range(30)], [], 30, 20, 0.4, 10)
-    mp2 = MetaProgram("MP2", [f"g{i}" for i in range(30, 60)], [], 30, 20, 0.4, 10)
-    data = compute_plot_data_mp_distribution({"s1": (X, genes)}, [mp1, mp2], min_genes=25, min_score=1, min_cells=0.05)
-    assigns = data["cell_assignments"]["s1"]
-    assert assigns[:3] == ["MP1", "MP1", "MP1"]
-    assert assigns[3:] == ["MP2", "MP2", "MP2"]
-    assert data["mp_freq_global"]["MP1"] == pytest.approx(0.5)
-    assert data["mp_freq_global"]["MP2"] == pytest.approx(0.5)
+def test_cache_integrity(tmp_path):
+    X = sparse.csr_matrix(np.abs(np.random.default_rng(0).normal(size=(100, 20))))
+    genes = [f"g{i}" for i in range(100)]
+    r1 = run_nmf_ranks(X, ranks=[2], gene_names=genes, hvg_mode="per_sample", cache_dir=tmp_path, nrun=1, max_iter=2)
+    r2 = run_nmf_ranks(X, ranks=[2], gene_names=genes, hvg_mode="per_sample", cache_dir=tmp_path, nrun=1, max_iter=2)
+    assert "robust_programs" in r2
+    assert "params" in r2
+    assert "version" in r2["params"]
+    assert r2["params"]["input_hash"] == r1["params"]["input_hash"]

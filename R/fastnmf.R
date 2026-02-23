@@ -1,181 +1,214 @@
-# Fast NMF in R (memory-aware + optional compiled backend hooks)
-
-.fastnmf_resolve_block_size <- function(m, n, k, max_memory_mb=NULL, block_size=NULL, bytes_per_num=8) {
-  if (!is.null(block_size)) return(max(1L, min(as.integer(block_size), as.integer(n))))
-  if (is.null(max_memory_mb)) return(as.integer(n))
-
-  # Approx working set per column block in H update:
-  # Xb[m,b] + numer[k,b] + denom[k,b] + H[,b] ~= (m + 3k) * b * bytes
-  budget <- as.integer(max_memory_mb * 1024 * 1024)
-  bytes_per_col <- (as.integer(m) + 3L * as.integer(k)) * as.integer(bytes_per_num)
-  b <- max(1L, budget %/% max(bytes_per_col, 1L))
-  min(as.integer(n), as.integer(b))
-}
-
-.fastnmf_mul <- function(A, B, use_compiled=TRUE) {
-  if (isTRUE(use_compiled) && requireNamespace("fastNMFcpp", quietly=TRUE)) {
-    return(fastNMFcpp::matmul(A, B))
-  }
-  A %*% B
-}
-
-fast_nmf <- function(
-  X,
-  k,
-  max_iter=300,
-  tol=1e-4,
-  seed=1,
-  check_every=5,
-  patience=3,
-  max_memory_mb=NULL,
-  block_size=NULL,
-  n_threads=NULL,
-  use_compiled=TRUE
-) {
-  if (any(X < 0)) stop("X must be non-negative")
-  if (k <= 0) stop("k must be > 0")
-
-  X <- as.matrix(X)
-  storage.mode(X) <- "double"
-  m <- nrow(X); n <- ncol(X)
-  if (k > min(m, n)) stop("k must be <= min(nrow(X), ncol(X))")
-
-  # Optional BLAS thread control (if RhpcBLASctl installed)
-  old_threads <- NULL
-  if (!is.null(n_threads) && requireNamespace("RhpcBLASctl", quietly=TRUE)) {
-    old_threads <- RhpcBLASctl::blas_get_num_procs()
-    RhpcBLASctl::blas_set_num_threads(as.integer(n_threads))
-  }
-  on.exit({
-    if (!is.null(old_threads) && requireNamespace("RhpcBLASctl", quietly=TRUE)) {
-      RhpcBLASctl::blas_set_num_threads(as.integer(old_threads))
+#' Parse rank specification
+#' @param ranks Integer vector/range or string like "4:9" / "4,6,9".
+#' @export
+parse_ranks <- function(ranks = 4:9) {
+  if (length(ranks) == 1 && is.character(ranks)) {
+    x <- trimws(ranks)
+    if (grepl(":", x, fixed = TRUE)) {
+      p <- as.integer(strsplit(x, ":", fixed = TRUE)[[1]])
+      if (length(p) == 2) return(seq.int(p[1], p[2]))
+      if (length(p) == 3) return(seq.int(p[1], p[3], by = p[2]))
+      stop("ranks must be start:end or start:step:end")
     }
-  }, add=TRUE)
+    if (grepl(",", x, fixed = TRUE)) return(as.integer(strsplit(x, ",", fixed = TRUE)[[1]]))
+    return(as.integer(x))
+  }
+  as.integer(ranks)
+}
 
-  set.seed(seed)
-  W <- matrix(runif(m * k), nrow=m, ncol=k) + 1e-10
-  H <- matrix(runif(k * n), nrow=k, ncol=n) + 1e-10
-
-  bsz <- .fastnmf_resolve_block_size(m, n, k, max_memory_mb=max_memory_mb, block_size=block_size)
-
-  best <- Inf
-  stale <- 0L
-  history <- numeric(0)
-
-  for (it in seq_len(max_iter)) {
-    WtW <- crossprod(W) # t(W) %*% W
-
-    if (bsz < n) {
-      for (j0 in seq.int(1L, n, by=bsz)) {
-        j1 <- min(n, j0 + bsz - 1L)
-        Xb <- X[, j0:j1, drop=FALSE]
-        numer <- crossprod(W, Xb) # t(W) %*% Xb
-        denom <- WtW %*% H[, j0:j1, drop=FALSE] + 1e-10
-        H[, j0:j1] <- H[, j0:j1, drop=FALSE] * (numer / denom)
+#' Unified expression matrix getter for Seurat/SCE/matrix.
+#' @export
+get_expr_matrix <- function(object,
+                            assay = if (inherits(object, "Seurat")) Seurat::DefaultAssay(object) else "RNA",
+                            layer = "counts",
+                            join_layers_if_needed = TRUE,
+                            enforce_sparse = TRUE) {
+  if (inherits(object, "Seurat")) {
+    assay_obj <- object[[assay]]
+    if (!is.null(assay_obj[[layer]])) {
+      m <- assay_obj[[layer]]
+    } else if (requireNamespace("SeuratObject", quietly = TRUE) && "Layers" %in% getNamespaceExports("SeuratObject")) {
+      lyr <- tryCatch(SeuratObject::Layers(assay_obj), error = function(e) character(0))
+      split_counts <- grep("^counts\\.", lyr, value = TRUE)
+      if (length(split_counts) > 1) {
+        if (isTRUE(join_layers_if_needed)) {
+          object <- SeuratObject::JoinLayers(object, assay = assay)
+          assay_obj <- object[[assay]]
+        } else {
+          stop("Detected split Seurat v5 layers; set join_layers_if_needed=TRUE or call JoinLayers().")
+        }
       }
+      m <- tryCatch(SeuratObject::LayerData(assay_obj, layer = layer), error = function(e) NULL)
+      if (is.null(m)) m <- Seurat::GetAssayData(object, assay = assay, slot = layer)
     } else {
-      numer <- crossprod(W, X)
-      denom <- WtW %*% H + 1e-10
-      H <- H * (numer / denom)
+      m <- Seurat::GetAssayData(object, assay = assay, slot = layer)
     }
-
-    HHt <- tcrossprod(H) # H %*% t(H)
-    numerW <- .fastnmf_mul(X, t(H), use_compiled=use_compiled)
-    denomW <- .fastnmf_mul(W, HHt, use_compiled=use_compiled) + 1e-10
-    W <- W * (numerW / denomW)
-
-    if (it %% check_every != 0 && it != max_iter) next
-
-    err <- norm(X - .fastnmf_mul(W, H, use_compiled=use_compiled), type="F")
-    history <- c(history, err)
-    rel_improve <- (best - err) / max(best, 1e-10)
-    if (rel_improve < tol) {
-      stale <- stale + 1L
-    } else {
-      stale <- 0L
-      best <- err
+    if (identical(layer, "data")) {
+      has_negative <- if (inherits(m, "dgCMatrix")) any(m@x < 0) else any(m < 0)
+      if (has_negative) stop("layer='data' contains negative values.")
     }
-    if (stale >= patience) break
+  } else if (inherits(object, "SingleCellExperiment")) {
+    m <- SummarizedExperiment::assay(object, i = layer)
+  } else if (inherits(object, "dgCMatrix") || is.matrix(object)) {
+    m <- object
+  } else {
+    stop("Unsupported input type")
   }
 
-  list(
-    W=W,
-    H=H,
-    err=if (length(history) > 0) tail(history, 1) else NA_real_,
-    n_iter=it,
-    history=history,
-    block_size=bsz,
-    n_threads=ifelse(is.null(n_threads), NA_integer_, as.integer(n_threads))
-  )
+  if (isTRUE(enforce_sparse) && !inherits(m, "dgCMatrix")) {
+    if (!requireNamespace("Matrix", quietly = TRUE)) stop("Matrix package required for sparse coercion")
+    m <- methods::as(m, "dgCMatrix")
+  }
+  m
 }
 
-select_k_fastnmf <- function(
-  X,
-  k_values,
-  metric="bic",
-  max_iter=200,
-  seed=1,
-  max_memory_mb=NULL,
-  block_size=NULL,
-  n_threads=NULL,
-  use_compiled=TRUE
-) {
-  scores <- c()
-  X <- as.matrix(X)
+#' NMF fit (HALS/ANLS)
+#' @export
+nmf_fit <- function(x, k, nrun = 10, method = c("hals", "anls"), max_iter = 500, tol = 1e-4,
+                    seed = 1, warm_start = TRUE, early_stop_patience = 10, l1_h = 0,
+                    return_loss = TRUE, init = NULL, float32 = FALSE) {
+  method <- match.arg(method)
+  X <- if (inherits(x, "dgCMatrix")) x else methods::as(x, "dgCMatrix")
+  if (float32) storage.mode(X@x) <- "single"
   m <- nrow(X); n <- ncol(X)
-  for (k in sort(unique(k_values))) {
-    fit <- fast_nmf(
-      X, k=k, max_iter=max_iter, seed=seed,
-      max_memory_mb=max_memory_mb, block_size=block_size,
-      n_threads=n_threads, use_compiled=use_compiled
-    )
-    if (metric == "reconstruction") {
-      score <- fit$err
-    } else if (metric == "bic") {
-      params <- k * (m + n)
-      sigma2 <- max((fit$err^2) / max(m*n, 1), 1e-10)
-      ll <- -0.5 * m * n * log(sigma2)
-      score <- -2.0 * ll + params * log(max(m*n, 2))
+  best <- NULL; best_loss <- Inf
+  for (ri in seq_len(nrun)) {
+    set.seed(seed + ri - 1)
+    if (!is.null(init) && warm_start) {
+      W <- pmax(init$W, 1e-10)
+      H <- pmax(init$H, 1e-10)
+      if (ncol(W) < k) W <- cbind(W, matrix(W[, ncol(W)], nrow(W), k - ncol(W)))
+      if (nrow(H) < k) H <- rbind(H, matrix(H[nrow(H), ], k - nrow(H), ncol(H), byrow = TRUE))
+      W <- W[, seq_len(k), drop = FALSE]
+      H <- H[seq_len(k), , drop = FALSE]
     } else {
-      stop("metric must be 'reconstruction' or 'bic'")
+      W <- matrix(runif(m * k), m, k) + 1e-10
+      H <- matrix(runif(k * n), k, n) + 1e-10
     }
-    scores[as.character(k)] <- score
+    history <- numeric(0); stale <- 0L; prev <- Inf
+    t0 <- proc.time()[3]
+    for (it in seq_len(max_iter)) {
+      if (method == "hals") {
+        H <- H * (as.matrix(crossprod(W, X)) / (crossprod(W) %*% H + l1_h + 1e-10))
+        W <- W * (as.matrix(X %*% t(H)) / (W %*% (H %*% t(H)) + 1e-10))
+      } else {
+        R <- X - W %*% H
+        H <- pmax(H + 0.01 * (crossprod(W, R)) - l1_h, 1e-10)
+        R <- X - W %*% H
+        W <- pmax(W + 0.01 * (R %*% t(H)), 1e-10)
+      }
+      R <- X - W %*% H
+      loss <- sqrt(sum(R@x^2))
+      if (return_loss) history <- c(history, loss)
+      rel <- (prev - loss) / max(prev, 1e-10)
+      stale <- if (rel < tol) stale + 1L else 0L
+      prev <- loss
+      if (stale >= early_stop_patience) break
+    }
+    fit <- list(W = W, H = H, loss_curve = history, n_iter = it, runtime = proc.time()[3] - t0,
+                seed = seed + ri - 1, backend = method, sparse_preserved_flag = TRUE)
+    final_loss <- ifelse(length(history) > 0, tail(history, 1), Inf)
+    if (final_loss < best_loss) { best <- fit; best_loss <- final_loss }
   }
-  best_k <- as.integer(names(scores)[which.min(scores)])
-  list(best_k=best_k, best_score=unname(min(scores)), scores=scores, metric=metric)
+  best
 }
 
-extract_gene_modules_3ca <- function(H, gene_names, top_n=50, min_specificity=1.5) {
-  k <- nrow(H); n_genes <- ncol(H)
-  if (length(gene_names) != n_genes) stop("gene_names length mismatch")
+#' Run NMF on multiple ranks and export 3CA-aligned basis matrix.
+#' @export
+run_nmf_ranks <- function(obj_or_matrix, ranks = 4:9, top_genes = 7000, topN = 50,
+                          assay = "RNA", layer = "counts", sample_id = "sample1",
+                          hvg_mode = c("global_fixed", "per_sample"), reference_genes = NULL,
+                          export_space = c("reference", "sample"), ...) {
+  hvg_mode <- match.arg(hvg_mode)
+  export_space <- match.arg(export_space)
+  X <- get_expr_matrix(obj_or_matrix, assay = assay, layer = layer, enforce_sparse = TRUE)
+  means <- Matrix::rowMeans(X)
+  sqmeans <- Matrix::rowMeans(X^2)
+  vars <- sqmeans - means * means
+  idx <- head(order(vars, decreasing = TRUE), top_genes)
+  genes_all <- rownames(X)
+  if (is.null(genes_all)) genes_all <- paste0("gene_", seq_len(nrow(X)))
+  genes <- genes_all[idx]
+  Xs <- X[idx, , drop = FALSE]
 
-  dominant <- max.col(t(H), ties.method="first")
-  maxv <- H[cbind(dominant, seq_len(n_genes))]
-  second <- apply(H, 2, function(v) {
-    if (length(v) == 1) return(1)
-    sort(v, decreasing=TRUE)[2]
-  })
-  specificity <- maxv / (second + 1e-10)
+  rr <- parse_ranks(ranks)
+  fits <- list(); warm <- NULL
+  for (k in rr) {
+    fits[[as.character(k)]] <- nmf_fit(Xs, k = k, init = warm, ...)
+    warm <- fits[[as.character(k)]]
+  }
+  basis <- do.call(cbind, lapply(rr, function(k) fits[[as.character(k)]]$W))
 
-  modules <- vector("list", k)
-  names(modules) <- paste0("module_", seq_len(k))
-
-  for (c in seq_len(k)) {
-    idx <- which(dominant == c & specificity >= min_specificity)
-    if (length(idx) == 0) {
-      modules[[c]] <- character(0)
-      next
-    }
-    ord <- idx[order(H[c, idx], decreasing=TRUE)]
-    modules[[c]] <- gene_names[head(ord, top_n)]
+  if (hvg_mode == "per_sample" && export_space == "reference") {
+    if (is.null(reference_genes)) stop("reference_genes is required for per_sample + reference export")
+    out <- matrix(0, nrow = length(reference_genes), ncol = ncol(basis), dimnames = list(reference_genes, NULL))
+    hit <- match(genes, reference_genes, nomatch = 0)
+    keep <- which(hit > 0)
+    out[hit[keep], ] <- basis[keep, , drop = FALSE]
+    basis <- out
+    genes <- reference_genes
   }
 
-  list(modules=modules, score_matrix=H)
+  colnames(basis) <- unlist(lapply(rr, function(k) paste0("K", k, "_P", seq_len(k))))
+  list(fits = fits, Genes_nmf_w_basis = basis, genes = genes, topN = topN,
+       params = list(
+         sample_intra_min_jaccard = 0.35,
+         require_distinct_k_support = 2,
+         min_cluster_size_programs = 2,
+         inter_min_jaccard_for_edge = 0.30,
+         mp_min_programs = 20,
+         mp_min_tumors = 12,
+         mp_median_intra_jaccard = 0.30,
+         seed = if (!is.null(list(...)$seed)) list(...)$seed else 1
+       ))
 }
 
-# Byte-compile hot R functions for modest speedup in pure-R fallback
-if (requireNamespace("compiler", quietly=TRUE)) {
-  fast_nmf <- compiler::cmpfun(fast_nmf)
-  select_k_fastnmf <- compiler::cmpfun(select_k_fastnmf)
-  extract_gene_modules_3ca <- compiler::cmpfun(extract_gene_modules_3ca)
+#' Compute Jaccard plot data (program/MP)
+#' @export
+compute_plot_data_jaccard <- function(gene_sets, ids = NULL, topN = 50) {
+  n <- length(gene_sets)
+  if (is.null(ids)) ids <- paste0("item_", seq_len(n))
+  gs <- lapply(gene_sets, function(x) unique(head(x, topN)))
+  mat <- matrix(1, n, n, dimnames = list(ids, ids))
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      if (i < j) {
+        a <- gs[[i]]; b <- gs[[j]]
+        val <- length(intersect(a, b)) / max(1, length(union(a, b)))
+        mat[i, j] <- val; mat[j, i] <- val
+      }
+    }
+  }
+  d <- as.dist(1 - mat)
+  hc <- if (n > 1) hclust(d, method = "average") else NULL
+  ord <- if (!is.null(hc)) hc$order else seq_len(n)
+  melted <- as.data.frame(as.table(mat), stringsAsFactors = FALSE)
+  names(melted) <- c("row", "col", "jaccard")
+  list(jaccard_matrix = mat, distance_matrix = 1 - mat, clustering = hc, order = ord,
+       annotations = list(), melted_df = melted)
+}
+
+#' Save Jaccard plot data
+#' @export
+save_plot_data_jaccard <- function(plot_data, out_dir, prefix = "jaccard") {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(plot_data$jaccard_matrix, file.path(out_dir, paste0(prefix, "_jaccard_matrix.csv")))
+  utils::write.csv(plot_data$distance_matrix, file.path(out_dir, paste0(prefix, "_distance_matrix.csv")))
+  utils::write.csv(plot_data$melted_df, file.path(out_dir, paste0(prefix, "_melted_df.csv")), row.names = FALSE)
+  meta <- list(order = plot_data$order)
+  jsonlite::write_json(meta, file.path(out_dir, paste0(prefix, "_metadata.json")), auto_unbox = TRUE, pretty = TRUE)
+}
+
+#' Plot Jaccard heatmap
+#' @export
+plot_jaccard <- function(plot_data, out_dir, prefix = "jaccard", style = "3ca") {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  ord <- plot_data$order
+  mat <- plot_data$jaccard_matrix[ord, ord, drop = FALSE]
+  grDevices::png(file.path(out_dir, paste0(prefix, ".png")), width = 1200, height = 1000, res = 150)
+  heatmap(mat, Rowv = NA, Colv = NA, scale = "none", col = hcl.colors(50, "Magma"), main = paste("Jaccard", style))
+  grDevices::dev.off()
+  grDevices::pdf(file.path(out_dir, paste0(prefix, ".pdf")), width = 8, height = 6)
+  heatmap(mat, Rowv = NA, Colv = NA, scale = "none", col = hcl.colors(50, "Magma"), main = paste("Jaccard", style))
+  grDevices::dev.off()
 }
